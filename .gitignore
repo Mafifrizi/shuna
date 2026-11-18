@@ -1,0 +1,12 @@
+/bin/
+/shuna
+*.exe
+*.out
+*.test
+*.key
+*.crt
+*.crl
+vault.json
+lockout.json
+recovery.pub
+.DS_Store
