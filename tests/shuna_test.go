@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -76,8 +77,18 @@ func TestArgon2idHKDFWipeAndMlock(t *testing.T) {
 		}
 	}
 
-	if _, err := kdf.LockSensitiveMemory(mk1, false); err != nil {
-		t.Fatalf("non-strict LockSensitiveMemory failed: %v", err)
+	if runtime.GOOS == "linux" {
+		warn, err := kdf.LockSensitiveMemory(mk1, true)
+		if err != nil {
+			t.Fatalf("strict LockSensitiveMemory failed on Linux: %v", err)
+		}
+		if warn != "" {
+			t.Fatalf("expected empty warning on strict LockSensitiveMemory success, got %q", warn)
+		}
+	} else {
+		if _, err := kdf.LockSensitiveMemory(mk1, false); err != nil {
+			t.Fatalf("non-strict LockSensitiveMemory failed: %v", err)
+		}
 	}
 	kdf.WipeBytes(mk1)
 	if err := kdf.UnlockSensitiveMemory(mk1); err != nil {
@@ -375,7 +386,13 @@ func TestMTLSHandshakeX25519MLKEM768AndCRLRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srvTLS, err := mtls.ServerTLSConfig(res.ServerCert.CertPath, res.ServerCert.KeyPath, res.CACertPath, crlMgr, mtls.TLSOptions{})
+	// Reload CRL from disk via an independent CRLManager instance (simulating separate server/CLI processes).
+	serverSideCRL, err := mtls.LoadCRL(res.CRLPath, caCert)
+	if err != nil {
+		t.Fatalf("LoadCRL initial: %v", err)
+	}
+
+	srvTLS, err := mtls.ServerTLSConfig(res.ServerCert.CertPath, res.ServerCert.KeyPath, res.CACertPath, serverSideCRL, mtls.TLSOptions{})
 	if err != nil {
 		t.Fatalf("ServerTLSConfig: %v", err)
 	}
@@ -542,6 +559,11 @@ func TestVaultDualReadRotationAndZeroize(t *testing.T) {
 		t.Fatalf("Encrypt v1: %v", err)
 	}
 
+	// Re-initializing an existing vault directory must fail closed (preventing key destruction).
+	if _, _, err := vault.InitVault(dir, []byte("overwrite-attempt"), vault.Options{}); contract.CodeOf(err) != contract.ExitPolicyStop {
+		t.Fatalf("InitVault overwrite code = %d, want 2", contract.CodeOf(err))
+	}
+
 	newVer, err := v.RotatePrepare([]byte("rotated-pass"))
 	if err != nil {
 		t.Fatalf("RotatePrepare: %v", err)
@@ -556,6 +578,17 @@ func TestVaultDualReadRotationAndZeroize(t *testing.T) {
 		t.Fatalf("Encrypt v2: %v", err)
 	}
 
+	// Dual-read across process restart (OpenVault + Unlock with rotated passphrase) before RetireKey.
+	v.Zeroize()
+	vReloaded, err := vault.OpenVault(dir, vault.Options{})
+	if err != nil {
+		t.Fatalf("OpenVault mid-rotation: %v", err)
+	}
+	if err := vReloaded.Unlock([]byte("rotated-pass")); err != nil {
+		t.Fatalf("Unlock mid-rotation with rotated-pass: %v", err)
+	}
+	v = vReloaded
+
 	// Dual-read: both v1 and v2 ciphertexts decrypt cleanly.
 	pt1, err := v.Decrypt(aad1, ct1)
 	if err != nil || string(pt1) != "payload-v1" {
@@ -564,6 +597,16 @@ func TestVaultDualReadRotationAndZeroize(t *testing.T) {
 	pt2, err := v.Decrypt(aad2, ct2)
 	if err != nil || string(pt2) != "payload-v2" {
 		t.Fatalf("dual-read v2 failed: %q err=%v", pt2, err)
+	}
+
+	// Non-zero AES-256-GCM nonce pad with unknown KeyVersion must still fail with CORRUPT_CIPHERTEXT (exit 4).
+	badGCM := make([]byte, envelope.HeaderSize+envelope.TagSize)
+	copy(badGCM[:6], envelope.Magic)
+	badGCM[6] = envelope.AlgAES256GCM
+	binary.BigEndian.PutUint32(badGCM[7:11], 999)
+	badGCM[30] = 0x55
+	if _, err := v.Decrypt(aad1, badGCM); contract.CodeOf(err) != contract.ExitCorruptCiphertext {
+		t.Fatalf("malformed GCM unknown kv code = %d, want 4", contract.CodeOf(err))
 	}
 
 	// Retiring active key must fail closed.
@@ -758,9 +801,33 @@ func TestCLIExitCodesAndWorkflows(t *testing.T) {
 		t.Fatalf("incomplete seal exit = %d, want 1", code)
 	}
 
-	// Exit 3: MISSING
+	// Exit 3: MISSING (both unseal and verify on missing dirs)
 	if code, _, _ := runCLI(env, "unseal", "--key", filepath.Join(work, "nope.key"), "--aad", "a", "--in", "b"); code != contract.ExitMissing {
 		t.Fatalf("missing key exit = %d, want 3", code)
+	}
+	if code, out, stderr := runCLI(nil, "verify", "--pki-dir", filepath.Join(work, "missing-pki"), "--json"); code != contract.ExitMissing {
+		t.Fatalf("verify missing pki exit = %d, want 3 (out=%s stderr=%s)", code, out, stderr)
+	}
+
+	// Exit 0: keygen --strict-mlock --json (and exit 2 under prlimit --memlock=0 on Linux)
+	if runtime.GOOS == "linux" {
+		strictVault := filepath.Join(work, "vault-strict-ok")
+		if code, out, stderr := runCLI(env, "keygen", "--out", strictVault, "--passphrase-env", "SHUNA_TEST_PASS", "--strict-mlock", "--json"); code != 0 {
+			t.Fatalf("keygen --strict-mlock failed (%d): %s %s", code, out, stderr)
+		}
+		if _, err := exec.LookPath("prlimit"); err == nil {
+			prOutDir := filepath.Join(work, "vault-strict-prlimit")
+			cmd := exec.Command("prlimit", "--memlock=0", binPath, "keygen", "--out", prOutDir, "--passphrase-env", "SHUNA_TEST_PASS", "--strict-mlock", "--json")
+			cmd.Env = append(os.Environ(), "SHUNA_TEST_PASS=cli-vault-pass")
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			err := cmd.Run()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != contract.ExitPolicyStop {
+				t.Fatalf("prlimit --memlock=0 keygen --strict-mlock err=%v out=%s stderr=%s, want exit 2", err, stdout.String(), stderr.String())
+			}
+		}
 	}
 
 	// Exit 0: keygen --json
@@ -874,9 +941,40 @@ func TestCLIExitCodesAndWorkflows(t *testing.T) {
 		t.Fatal("partial unsealed stream file should not exist after failure")
 	}
 
-	// Rotate + unlock-reset + stdin/stdout seal/unseal
-	if code, _, stderr := runCLI(env, "rotate", "--vault", vaultDir, "--passphrase-env", "SHUNA_TEST_PASS", "--json"); code != 0 {
+	// Seal with Vault + explicit --alg aes256gcm must produce AES-256-GCM ciphertext AND report aes-256-gcm in JSON.
+	vaultGCMOut := filepath.Join(work, "vault-gcm.shuna1")
+	code, out, stderr = runCLI(env, "seal", "--key", vaultDir, "--passphrase-env", "SHUNA_TEST_PASS", "--aad", "vault-gcm", "--in", plainPath, "--out", vaultGCMOut, "--alg", "aes256gcm", "--json")
+	if code != 0 {
+		t.Fatalf("vault seal aes256gcm failed (%d): %s %s", code, out, stderr)
+	}
+	var sealWrap struct {
+		Data struct {
+			Algorithm string `json:"algorithm"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &sealWrap); err != nil || sealWrap.Data.Algorithm != "aes-256-gcm" {
+		t.Fatalf("unexpected seal JSON algorithm: %s (%v)", out, err)
+	}
+	vaultGCMBytes, err := os.ReadFile(vaultGCMOut)
+	if err != nil || len(vaultGCMBytes) < envelope.HeaderSize || vaultGCMBytes[6] != envelope.AlgAES256GCM {
+		t.Fatalf("vault seal --alg aes256gcm wrote alg 0x%02x, want 0x02", vaultGCMBytes[6])
+	}
+
+	// Rotate to a NEW passphrase + unseal pre-rotation v1 ciphertext with new passphrase + unlock-reset
+	env2 := map[string]string{
+		"SHUNA_TEST_PASS":     "cli-vault-pass",
+		"SHUNA_TEST_NEW_PASS": "cli-vault-pass-v2",
+	}
+	if code, _, stderr := runCLI(env2, "rotate", "--vault", vaultDir, "--passphrase-env", "SHUNA_TEST_PASS", "--new-passphrase-env", "SHUNA_TEST_NEW_PASS", "--json"); code != 0 {
 		t.Fatalf("rotate failed (%d): %s", code, stderr)
+	}
+	envOnlyNew := map[string]string{"SHUNA_TEST_NEW_PASS": "cli-vault-pass-v2"}
+	vaultGCMDec := filepath.Join(work, "vault-gcm.dec.txt")
+	if code, _, stderr := runCLI(envOnlyNew, "unseal", "--key", vaultDir, "--passphrase-env", "SHUNA_TEST_NEW_PASS", "--aad", "vault-gcm", "--in", vaultGCMOut, "--out", vaultGCMDec, "--json"); code != 0 {
+		t.Fatalf("dual-read unseal after passphrase rotate failed (%d): %s", code, stderr)
+	}
+	if got, err := os.ReadFile(vaultGCMDec); err != nil || string(got) != "hello-shuna-cli" {
+		t.Fatalf("dual-read unseal content = %q, err=%v", got, err)
 	}
 	if code, _, stderr := runCLI(env, "unlock-reset", "--vault", vaultDir, "--recovery-key", filepath.Join(vaultDir, "recovery.key"), "--new-passphrase-env", "SHUNA_TEST_PASS", "--json"); code != 0 {
 		t.Fatalf("unlock-reset failed (%d): %s", code, stderr)

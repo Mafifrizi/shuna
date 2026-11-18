@@ -178,6 +178,12 @@ func InitVault(dir string, passphrase []byte, opts Options) (*Vault, *InitResult
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, nil, fmt.Errorf("create vault dir: %w", err)
 	}
+	metaPath := filepath.Join(dir, VaultFileName)
+	if _, err := os.Stat(metaPath); err == nil {
+		return nil, nil, contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", "vault already exists", nil)
+	} else if !os.IsNotExist(err) {
+		return nil, nil, fmt.Errorf("stat vault metadata: %w", err)
+	}
 
 	recPriv, recPub, err := pqc.GenerateKeyPair()
 	if err != nil {
@@ -234,7 +240,6 @@ func InitVault(dir string, passphrase []byte, opts Options) (*Vault, *InitResult
 		},
 	}
 
-	metaPath := filepath.Join(dir, VaultFileName)
 	v := &Vault{
 		dir:          dir,
 		metaPath:     metaPath,
@@ -283,9 +288,12 @@ func OpenVault(dir string, opts Options) (*Vault, error) {
 	if meta.StrictLockoutWipe {
 		opts.StrictLockoutWipe = true
 	}
-	opts = normalizeOpts(dir, opts)
-	if meta.Algorithm != 0 {
+	if opts.Algorithm == 0 && meta.Algorithm != 0 {
 		opts.Algorithm = meta.Algorithm
+	}
+	opts = normalizeOpts(dir, opts)
+	if opts.Algorithm != envelope.AlgXChaCha20Poly1305 && opts.Algorithm != envelope.AlgAES256GCM {
+		return nil, contract.NewError(contract.ExitUsage, "USAGE", "unsupported vault algorithm", envelope.ErrUnsupportedAlg)
 	}
 
 	return &Vault{
@@ -295,6 +303,13 @@ func OpenVault(dir string, opts Options) (*Vault, error) {
 		meta:     meta,
 		deks:     make(map[uint32][]byte),
 	}, nil
+}
+
+// Algorithm returns the active SHUNA1 algorithm configured on the Vault.
+func (v *Vault) Algorithm() byte {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.opts.Algorithm
 }
 
 // MlockWarning returns any non-fatal memory-locking warning observed during key initialization or unlock.
@@ -386,6 +401,14 @@ func (v *Vault) Unlock(passphrase []byte) error {
 		}
 	}
 
+	if err := v.opts.LockoutStore.Save(LockoutState{}); err != nil {
+		for _, d := range loaded {
+			kdf.WipeBytes(d)
+			_ = kdf.UnlockSensitiveMemory(d)
+		}
+		return err
+	}
+
 	v.mu.Lock()
 	for ver, old := range v.deks {
 		kdf.WipeBytes(old)
@@ -397,10 +420,6 @@ func (v *Vault) Unlock(passphrase []byte) error {
 		v.mlockWarning = warn
 	}
 	v.mu.Unlock()
-
-	if err := v.opts.LockoutStore.Save(LockoutState{}); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -462,33 +481,68 @@ func (v *Vault) UnlockWithRecoveryKey(priv *pqc.HybridPrivateKey, newPassphrase 
 		if ver == v.meta.ActiveVersion || rec.Retired || len(rec.RecoveryWrappedDEK) == 0 {
 			continue
 		}
-		if dek, err := pqc.UnwrapKey(priv, rec.RecoveryWrappedDEK, rec.RecoveryKEMCiphertext, recoveryAAD(ver)); err == nil {
-			if _, merr := kdf.LockSensitiveMemory(dek, v.opts.StrictMlock); merr == nil {
-				loaded[ver] = dek
-			} else {
-				kdf.WipeBytes(dek)
-			}
+		dek, uerr := pqc.UnwrapKey(priv, rec.RecoveryWrappedDEK, rec.RecoveryKEMCiphertext, recoveryAAD(ver))
+		if uerr != nil {
+			continue
 		}
+		w, merr := kdf.LockSensitiveMemory(dek, v.opts.StrictMlock)
+		if merr != nil {
+			kdf.WipeBytes(dek)
+			for _, d := range loaded {
+				kdf.WipeBytes(d)
+				_ = kdf.UnlockSensitiveMemory(d)
+			}
+			return contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", "strict mlock failed", merr)
+		}
+		if warn == "" && w != "" {
+			warn = w
+		}
+		loaded[ver] = dek
 	}
 
 	if len(newPassphrase) > 0 {
-		salt, wrapped, err := wrapDEKWithPassphrase(activeRec.Version, activeDEK, newPassphrase)
-		if err != nil {
+		type savedWrap struct {
+			rec     *KeyRecord
+			salt    []byte
+			wrapped []byte
+		}
+		var backups []savedWrap
+		rollback := func() {
+			for _, b := range backups {
+				b.rec.Salt = b.salt
+				b.rec.WrappedDEK = b.wrapped
+			}
 			for _, d := range loaded {
 				kdf.WipeBytes(d)
 				_ = kdf.UnlockSensitiveMemory(d)
 			}
-			return err
 		}
-		activeRec.Salt = salt
-		activeRec.WrappedDEK = wrapped
+		for ver, dek := range loaded {
+			rec := v.meta.Keys[ver]
+			if rec == nil {
+				continue
+			}
+			salt, wrapped, err := wrapDEKWithPassphrase(ver, dek, newPassphrase)
+			if err != nil {
+				rollback()
+				return err
+			}
+			backups = append(backups, savedWrap{rec: rec, salt: rec.Salt, wrapped: rec.WrappedDEK})
+			rec.Salt = salt
+			rec.WrappedDEK = wrapped
+		}
 		if err := v.saveMetaLocked(); err != nil {
-			for _, d := range loaded {
-				kdf.WipeBytes(d)
-				_ = kdf.UnlockSensitiveMemory(d)
-			}
+			rollback()
 			return err
 		}
+	}
+
+	if err := v.opts.LockoutStore.Save(LockoutState{}); err != nil {
+		for _, d := range loaded {
+			kdf.WipeBytes(d)
+			_ = kdf.UnlockSensitiveMemory(d)
+		}
+		return err
 	}
 
 	for ver, old := range v.deks {
@@ -501,7 +555,7 @@ func (v *Vault) UnlockWithRecoveryKey(priv *pqc.HybridPrivateKey, newPassphrase 
 		v.mlockWarning = warn
 	}
 
-	return v.opts.LockoutStore.Save(LockoutState{})
+	return nil
 }
 
 func (v *Vault) ActiveKeyVersion() uint32 {
@@ -603,6 +657,35 @@ func (v *Vault) RotatePrepare(newPassphrase []byte) (uint32, error) {
 		}
 	}
 
+	type savedWrap struct {
+		rec     *KeyRecord
+		salt    []byte
+		wrapped []byte
+	}
+	var rewrapBackups []savedWrap
+	rollbackRewraps := func() {
+		for _, b := range rewrapBackups {
+			b.rec.Salt = b.salt
+			b.rec.WrappedDEK = b.wrapped
+		}
+	}
+	for ver, dek := range v.deks {
+		rec := v.meta.Keys[ver]
+		if rec == nil || rec.Retired || len(dek) == 0 {
+			continue
+		}
+		rsalt, rwrapped, rerr := wrapDEKWithPassphrase(ver, dek, newPassphrase)
+		if rerr != nil {
+			rollbackRewraps()
+			kdf.WipeBytes(newDEK)
+			_ = kdf.UnlockSensitiveMemory(newDEK)
+			return 0, rerr
+		}
+		rewrapBackups = append(rewrapBackups, savedWrap{rec: rec, salt: rec.Salt, wrapped: rec.WrappedDEK})
+		rec.Salt = rsalt
+		rec.WrappedDEK = rwrapped
+	}
+
 	now := v.opts.Now().UTC()
 	oldRec.Active = false
 	oldRec.DecryptOnly = true
@@ -621,6 +704,7 @@ func (v *Vault) RotatePrepare(newPassphrase []byte) (uint32, error) {
 	v.deks[newVer] = newDEK
 
 	if err := v.saveMetaLocked(); err != nil {
+		rollbackRewraps()
 		oldRec.Active = true
 		oldRec.DecryptOnly = false
 		oldRec.RotatedAt = nil

@@ -443,8 +443,13 @@ func checkPeerRevocation(rawCerts [][]byte, verifiedChains [][]*x509.Certificate
 	if leaf == nil {
 		return errors.New("missing peer leaf certificate")
 	}
-	if crl != nil && crl.IsRevoked(leaf.SerialNumber) {
-		return fmt.Errorf("%w: serial %s", ErrCertRevoked, FormatSerial(leaf.SerialNumber))
+	if crl != nil {
+		if err := crl.ReloadIfChanged(); err != nil {
+			return err
+		}
+		if crl.IsRevoked(leaf.SerialNumber) {
+			return fmt.Errorf("%w: serial %s", ErrCertRevoked, FormatSerial(leaf.SerialNumber))
+		}
 	}
 	if extra != nil && extra(FormatSerial(leaf.SerialNumber)) {
 		return fmt.Errorf("%w: serial %s", ErrCertRevoked, FormatSerial(leaf.SerialNumber))

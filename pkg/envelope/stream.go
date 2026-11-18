@@ -9,6 +9,8 @@ import (
 	"math"
 
 	"golang.org/x/crypto/chacha20poly1305"
+
+	"github.com/Mafifrizi/shuna/pkg/kdf"
 )
 
 const (
@@ -61,6 +63,7 @@ func SealStreamWithOptions(r io.Reader, w io.Writer, key []byte, keyVersion uint
 	}
 
 	buf := make([]byte, int(chunkSize)+1)
+	defer kdf.WipeBytes(buf)
 	var peeked byte
 	hasPeeked := false
 	var counter uint64
@@ -177,6 +180,8 @@ func UnsealStreamWithKeyLookup(r io.Reader, w io.Writer, lookup func(keyVersion 
 	copy(nonce[:StreamIDSize], streamID)
 	chunkAADBuf := make([]byte, len(aad)+StreamMagicLen+4+StreamIDSize+8+1)
 	ctBuf := make([]byte, int(chunkSize)+TagSize)
+	ptBuf := make([]byte, 0, int(chunkSize))
+	defer kdf.WipeBytes(ptBuf[:cap(ptBuf)])
 
 	for {
 		var frameHdr [chunkFrameHeaderSize]byte
@@ -208,14 +213,16 @@ func UnsealStreamWithKeyLookup(r io.Reader, w io.Writer, lookup func(keyVersion 
 		binary.BigEndian.PutUint64(nonce[StreamIDSize:NonceSlotSize], expectedCounter)
 		chunkAAD := buildChunkAAD(chunkAADBuf[:0], aad, keyVersion, streamID, expectedCounter, finalFlag)
 
-		pt, err := aead.Open(nil, nonce[:], ctBuf[:ctLen], chunkAAD)
+		pt, err := aead.Open(ptBuf[:0], nonce[:], ctBuf[:ctLen], chunkAAD)
 		if err != nil {
 			return corruptErr(fmt.Sprintf("SHUNAS1 chunk %d authentication failed", expectedCounter), err)
 		}
 
 		if len(pt) > 0 {
-			if _, err := w.Write(pt); err != nil {
-				return fmt.Errorf("write plaintext chunk: %w", err)
+			_, werr := w.Write(pt)
+			kdf.WipeBytes(pt)
+			if werr != nil {
+				return fmt.Errorf("write plaintext chunk: %w", werr)
 			}
 		}
 

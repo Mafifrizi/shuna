@@ -98,6 +98,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 func hasJSONFlag(args []string) bool {
 	for _, a := range args {
+		if a == "--" {
+			break
+		}
 		if a == "--json" || a == "-json" || a == "--json=true" || a == "-json=true" {
 			return true
 		}
@@ -114,6 +117,9 @@ func newFlagSet(name string) *flag.FlagSet {
 func parseFlags(fs *flag.FlagSet, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return contract.NewError(contract.ExitUsage, "USAGE", err.Error(), err)
+	}
+	if fs.NArg() > 0 {
+		return contract.NewError(contract.ExitUsage, "USAGE", fmt.Sprintf("unexpected positional arguments: %v", fs.Args()), nil)
 	}
 	return nil
 }
@@ -282,18 +288,28 @@ func cmdSeal(args []string, stdin io.Reader, stdout io.Writer) (cmdResult, error
 	if *keyPath == "" || *inPath == "" {
 		return cmdResult{}, contract.NewError(contract.ExitUsage, "USAGE", "--key and --in are required", nil)
 	}
+	algExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "alg" {
+			algExplicit = true
+		}
+	})
 	alg, err := envelope.ParseAlg(*algName)
 	if err != nil {
 		return cmdResult{}, contract.NewError(contract.ExitUsage, "USAGE", err.Error(), err)
 	}
-	if *streamMode && alg != envelope.AlgXChaCha20Poly1305 {
+	if *streamMode && algExplicit && alg != envelope.AlgXChaCha20Poly1305 {
 		return cmdResult{}, contract.NewError(contract.ExitUsage, "USAGE", "SHUNAS1 streaming mode requires xchacha20", nil)
 	}
 	if *streamMode && *jsonFlag && *outPath == "" {
 		return cmdResult{}, contract.NewError(contract.ExitUsage, "USAGE", "--stream with --json requires --out <file>", nil)
 	}
 
-	v, rawKey, err := loadKeyOrVault(*keyPath, *passEnv, *strictMlock, alg)
+	vaultAlg := byte(0)
+	if algExplicit {
+		vaultAlg = alg
+	}
+	v, rawKey, err := loadKeyOrVault(*keyPath, *passEnv, *strictMlock, vaultAlg)
 	if err != nil {
 		return cmdResult{}, err
 	}
@@ -343,13 +359,18 @@ func cmdSeal(args []string, stdin io.Reader, stdout io.Writer) (cmdResult, error
 	defer kdf.WipeBytes(plaintext)
 
 	var blob []byte
+	usedAlg := alg
 	if v != nil {
+		usedAlg = v.Algorithm()
 		blob, err = v.Encrypt([]byte(*aad), plaintext)
 	} else {
 		blob, err = envelope.Seal(alg, 1, rawKey, []byte(*aad), plaintext)
 	}
 	if err != nil {
 		return cmdResult{}, err
+	}
+	if len(blob) > 6 {
+		usedAlg = blob[6]
 	}
 
 	if *outPath != "" {
@@ -360,7 +381,7 @@ func cmdSeal(args []string, stdin io.Reader, stdout io.Writer) (cmdResult, error
 			Message: fmt.Sprintf("sealed %d bytes to %s", len(blob), *outPath),
 			Data: map[string]any{
 				"format":    envelope.Magic,
-				"algorithm": envelope.AlgName(alg),
+				"algorithm": envelope.AlgName(usedAlg),
 				"bytes":     len(blob),
 				"out":       *outPath,
 			},
@@ -372,7 +393,7 @@ func cmdSeal(args []string, stdin io.Reader, stdout io.Writer) (cmdResult, error
 			Message: "sealed envelope",
 			Data: map[string]any{
 				"format":         envelope.Magic,
-				"algorithm":      envelope.AlgName(alg),
+				"algorithm":      envelope.AlgName(usedAlg),
 				"bytes":          len(blob),
 				"ciphertext_b64": base64.StdEncoding.EncodeToString(blob),
 			},
@@ -402,7 +423,7 @@ func cmdUnseal(args []string, stdin io.Reader, stdout io.Writer) (cmdResult, err
 		return cmdResult{}, contract.NewError(contract.ExitUsage, "USAGE", "--stream with --json requires --out <file>", nil)
 	}
 
-	v, rawKey, err := loadKeyOrVault(*keyPath, *passEnv, *strictMlock, envelope.AlgXChaCha20Poly1305)
+	v, rawKey, err := loadKeyOrVault(*keyPath, *passEnv, *strictMlock, 0)
 	if err != nil {
 		return cmdResult{}, err
 	}
@@ -569,7 +590,10 @@ func cmdVerify(args []string) (cmdResult, error) {
 	}
 
 	report, err := mtls.VerifyPKI(*pkiDir, *certPath)
-	msg := fmt.Sprintf("verified PKI in %s (%d cert(s), %d revoked)", *pkiDir, len(report.Certificates), report.RevokedCount)
+	msg := ""
+	if report != nil {
+		msg = fmt.Sprintf("verified PKI in %s (%d cert(s), %d revoked)", *pkiDir, len(report.Certificates), report.RevokedCount)
+	}
 	return cmdResult{
 		Message: msg,
 		Data:    report,
@@ -640,16 +664,16 @@ func loadKeyOrVault(path, passEnv string, strictMlock bool, alg byte) (*vault.Va
 		if !info.IsDir() {
 			dir = filepath.Dir(path)
 		}
+		v, err := vault.OpenVault(dir, vault.Options{Algorithm: alg, StrictMlock: strictMlock})
+		if err != nil {
+			return nil, nil, err
+		}
 		pass, err := resolvePassphrase(passEnv, true)
 		if err != nil {
 			return nil, nil, err
 		}
 		defer kdf.WipeBytes(pass)
 
-		v, err := vault.OpenVault(dir, vault.Options{Algorithm: alg, StrictMlock: strictMlock})
-		if err != nil {
-			return nil, nil, err
-		}
 		if err := v.Unlock(pass); err != nil {
 			v.Zeroize()
 			return nil, nil, err

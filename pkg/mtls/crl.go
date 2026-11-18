@@ -78,12 +78,14 @@ func ParseReason(reason string) (int, error) {
 
 // CRLManager maintains a signed PEM CRL on disk and an O(1) in-memory revocation set.
 type CRLManager struct {
-	mu        sync.RWMutex
-	caCert    *x509.Certificate
-	caKey     *ecdsa.PrivateKey
-	crlPath   string
-	entries   map[string]x509.RevocationListEntry
-	crlNumber *big.Int
+	mu          sync.RWMutex
+	caCert      *x509.Certificate
+	caKey       *ecdsa.PrivateKey
+	crlPath     string
+	entries     map[string]x509.RevocationListEntry
+	crlNumber   *big.Int
+	lastModTime time.Time
+	lastSize    int64
 }
 
 // LoadCRL loads and verifies an existing signed PEM CRL against caCert for read-only lookups.
@@ -136,7 +138,68 @@ func OpenCRLManager(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, crlPath s
 	if rl.Number != nil {
 		mgr.crlNumber = new(big.Int).Add(rl.Number, big.NewInt(1))
 	}
+	if info, statErr := os.Stat(crlPath); statErr == nil {
+		mgr.lastModTime = info.ModTime()
+		mgr.lastSize = info.Size()
+	}
 	return mgr, nil
+}
+
+// ReloadIfChanged reloads and verifies ca.crl from disk if its modification time or size changed.
+func (m *CRLManager) ReloadIfChanged() error {
+	if m == nil || m.crlPath == "" {
+		return nil
+	}
+	info, err := os.Stat(m.crlPath)
+	if err != nil {
+		return fmt.Errorf("stat CRL: %w", err)
+	}
+
+	m.mu.RLock()
+	unchanged := info.ModTime().Equal(m.lastModTime) && info.Size() == m.lastSize
+	m.mu.RUnlock()
+	if unchanged {
+		return nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	info, err = os.Stat(m.crlPath)
+	if err != nil {
+		return fmt.Errorf("stat CRL: %w", err)
+	}
+	if info.ModTime().Equal(m.lastModTime) && info.Size() == m.lastSize {
+		return nil
+	}
+
+	raw, err := os.ReadFile(m.crlPath)
+	if err != nil {
+		return fmt.Errorf("read CRL: %w", err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil || block.Type != "X509 CRL" {
+		return ErrInvalidCRL
+	}
+	rl, err := x509.ParseRevocationList(block.Bytes)
+	if err != nil {
+		return contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", "parse CRL failed", err)
+	}
+	if err := rl.CheckSignatureFrom(m.caCert); err != nil {
+		return contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", "CRL signature verification failed", err)
+	}
+
+	entries := make(map[string]x509.RevocationListEntry, len(rl.RevokedCertificateEntries))
+	for _, e := range rl.RevokedCertificateEntries {
+		entries[FormatSerial(e.SerialNumber)] = e
+	}
+	m.entries = entries
+	if rl.Number != nil {
+		m.crlNumber = new(big.Int).Add(rl.Number, big.NewInt(1))
+	}
+	m.lastModTime = info.ModTime()
+	m.lastSize = info.Size()
+	return nil
 }
 
 // Revoke adds serialHex to the CRL, re-signs ca.crl atomically, and updates the live lookup set.
@@ -254,6 +317,10 @@ func (m *CRLManager) writeLocked() error {
 		return fmt.Errorf("rename CRL: %w", err)
 	}
 
+	if info, statErr := os.Stat(m.crlPath); statErr == nil {
+		m.lastModTime = info.ModTime()
+		m.lastSize = info.Size()
+	}
 	m.crlNumber = new(big.Int).Add(m.crlNumber, big.NewInt(1))
 	return nil
 }

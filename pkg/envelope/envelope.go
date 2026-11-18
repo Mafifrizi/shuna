@@ -78,6 +78,15 @@ func InspectHeader(blob []byte) (Header, error) {
 	if alg != AlgXChaCha20Poly1305 && alg != AlgAES256GCM {
 		return Header{}, corruptErr(fmt.Sprintf("unknown SHUNA1 algorithm 0x%02x", alg), nil)
 	}
+	if alg == AlgAES256GCM {
+		var padCheck byte
+		for _, b := range blob[23:35] {
+			padCheck |= b
+		}
+		if padCheck != 0 {
+			return Header{}, corruptErr("non-zero padding in AES-256-GCM nonce slot", nil)
+		}
+	}
 	return Header{
 		AlgID:      alg,
 		KeyVersion: binary.BigEndian.Uint32(blob[7:11]),
