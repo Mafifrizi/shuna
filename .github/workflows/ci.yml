@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: Vet, Race Test & Build Shuna
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.24
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: go.sum
+
+      - name: Run Go Vet (Linux & Windows Targets)
+        run: |
+          make vet
+          GOOS=windows go vet ./...
+
+      - name: Run Race Test Suite
+        run: make test-race
+
+      - name: Build CLI Binary & Smoke Check
+        run: |
+          make build
+          ./bin/shuna --help >/dev/null

@@ -1,0 +1,64 @@
+name: Bug Report
+description: Report a cryptographic, vault, PKI, or CLI bug in Shuna
+title: "fix: [short description of the issue]"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue. Provide exact reproduction steps and exit codes below so maintainers can diagnose and resolve it quickly.
+
+  - type: dropdown
+    id: package
+    attributes:
+      label: Affected Package
+      options:
+        - pkg/envelope (SHUNA1 / SHUNAS1)
+        - pkg/kdf (Argon2id / HKDF-SHA512 / mlock)
+        - pkg/pqc (ML-KEM-1024 + X25519)
+        - pkg/mtls (ECDSA P-384 CA / CRL / X25519MLKEM768)
+        - pkg/vault (Rotation / Lockout / Recovery)
+        - cmd/shuna (CLI)
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Operating System and Go Toolchain
+      placeholder: "Linux x86_64, Go 1.24"
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or API Call Executed
+      placeholder: "shuna unseal --key ./vault --aad secrets:v1 --in sealed.shuna1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual_behavior
+    attributes:
+      label: Actual Behavior and Error Output
+      description: Include JSON output, error messages, or semantic exit codes (0..4).
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmation Checklist
+      options:
+        - label: I verified that no passphrases, private keys, recovery keys, or real ciphertexts with secrets are included in this report.
+          required: true
+        - label: I checked existing issues to make sure this is not a duplicate.
+          required: true

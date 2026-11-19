@@ -1,0 +1,35 @@
+name: Feature Proposal
+description: Propose a new cryptographic workflow, CLI option, or PKI capability for Shuna
+title: "feat: [short summary of feature]"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposals for new vault, envelope, recovery, or mTLS 1.3 PKI capabilities are welcome.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What security or operational requirement does this address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the package API, wire format impact, or CLI flags.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: compliance
+    attributes:
+      label: Cryptographic Alignment
+      options:
+        - label: Uses only Go standard library and vetted golang.org/x/crypto primitives with zero homegrown ciphers.
+          required: true
+        - label: Preserves fail-closed error semantics (exit codes 0..4), strict AlgID-first parsing, and WipeBytes memory zeroization.
+          required: true

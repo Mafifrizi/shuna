@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Community Discussions and Cryptography Questions
+    url: https://github.com/Mafifrizi/shuna/discussions
+    about: Ask questions about SHUNA1/SHUNAS1 wire formats, mTLS 1.3 PKI, or vault lifecycle integration.
+  - name: Security Vulnerability Reporting
+    url: https://github.com/Mafifrizi/shuna/security/advisories/new
+    about: Privately disclose cryptographic, memory-handling, or PKI vulnerabilities.
