@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mafifrizi/shuna/internal/flock"
 	"github.com/Mafifrizi/shuna/pkg/contract"
 	"github.com/Mafifrizi/shuna/pkg/envelope"
 	"github.com/Mafifrizi/shuna/pkg/kdf"
@@ -65,6 +66,10 @@ type LockoutStore interface {
 	Save(LockoutState) error
 }
 
+type lockoutUpdater interface {
+	Update(func(LockoutState) (LockoutState, error)) error
+}
+
 // FileLockoutStore persists LockoutState in a 0600 JSON file.
 type FileLockoutStore struct {
 	path string
@@ -74,7 +79,7 @@ func NewFileLockoutStore(path string) *FileLockoutStore {
 	return &FileLockoutStore{path: path}
 }
 
-func (s *FileLockoutStore) Load() (LockoutState, error) {
+func (s *FileLockoutStore) loadUnlocked() (LockoutState, error) {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -89,12 +94,48 @@ func (s *FileLockoutStore) Load() (LockoutState, error) {
 	return st, nil
 }
 
-func (s *FileLockoutStore) Save(st LockoutState) error {
+func (s *FileLockoutStore) saveUnlocked(st LockoutState) error {
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
 	}
 	return writeAtomic(s.path, data, 0600)
+}
+
+func (s *FileLockoutStore) Load() (LockoutState, error) {
+	if _, err := os.Stat(filepath.Dir(s.path)); os.IsNotExist(err) {
+		return LockoutState{}, nil
+	}
+	var st LockoutState
+	err := flock.WithShared(s.path, 0600, true, func() error {
+		var loadErr error
+		st, loadErr = s.loadUnlocked()
+		return loadErr
+	})
+	return st, err
+}
+
+func (s *FileLockoutStore) Save(st LockoutState) error {
+	return flock.WithExclusive(s.path, 0600, func() error {
+		return s.saveUnlocked(st)
+	})
+}
+
+func (s *FileLockoutStore) Update(fn func(LockoutState) (LockoutState, error)) error {
+	if fn == nil {
+		return nil
+	}
+	return flock.WithExclusive(s.path, 0600, func() error {
+		cur, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		next, err := fn(cur)
+		if err != nil {
+			return err
+		}
+		return s.saveUnlocked(next)
+	})
 }
 
 // KeyRecord holds wrapped DEK metadata for a specific key version.
@@ -423,27 +464,70 @@ func (v *Vault) Unlock(passphrase []byte) error {
 	return nil
 }
 
-func (v *Vault) recordUnlockFailure(state LockoutState, now time.Time) error {
+func applyFailureTransition(state LockoutState, now time.Time, strictWipe bool) LockoutState {
 	state.FailedAttempts++
 	state.LastFailureAt = now
-
 	if state.FailedAttempts >= MaxFailedAttempts {
 		state.LockedUntil = now.Add(HardLockoutDuration)
 		state.CooldownUntil = time.Time{}
-		if v.opts.StrictLockoutWipe {
+		if strictWipe {
 			state.WipedLocked = true
-			v.Zeroize()
 		}
-		if err := v.opts.LockoutStore.Save(state); err != nil {
-			return err
-		}
-		return contract.NewError(contract.ExitPolicyStop, "VAULT_LOCKED", fmt.Sprintf("max failed attempts (%d) reached; vault locked for 15m", MaxFailedAttempts), ErrVaultLocked)
+		return state
 	}
-
 	backoff := time.Duration(1<<(state.FailedAttempts-1)) * time.Second
 	state.CooldownUntil = now.Add(backoff)
-	if err := v.opts.LockoutStore.Save(state); err != nil {
+	return state
+}
+
+func (v *Vault) recordUnlockFailure(state LockoutState, now time.Time) error {
+	if updater, ok := v.opts.LockoutStore.(lockoutUpdater); ok {
+		var shouldZeroize bool
+		var hardLocked bool
+		err := updater.Update(func(cur LockoutState) (LockoutState, error) {
+			if cur.WipedLocked {
+				if v.opts.StrictLockoutWipe {
+					shouldZeroize = true
+				}
+				return cur, contract.NewError(contract.ExitPolicyStop, "VAULT_LOCKED", "vault wiped due to strict lockout; admin unlock-reset required", ErrVaultLocked)
+			}
+			if cur.FailedAttempts >= MaxFailedAttempts && now.Before(cur.LockedUntil) {
+				rem := int(cur.LockedUntil.Sub(now).Seconds())
+				if rem < 1 {
+					rem = 1
+				}
+				return cur, contract.NewError(contract.ExitPolicyStop, "VAULT_LOCKED", fmt.Sprintf("vault locked for %ds", rem), ErrVaultLocked)
+			}
+			next := applyFailureTransition(cur, now, v.opts.StrictLockoutWipe)
+			if next.WipedLocked {
+				shouldZeroize = true
+			}
+			if next.FailedAttempts >= MaxFailedAttempts {
+				hardLocked = true
+			}
+			return next, nil
+		})
+		if shouldZeroize {
+			v.Zeroize()
+		}
+		if err != nil {
+			return err
+		}
+		if hardLocked {
+			return contract.NewError(contract.ExitPolicyStop, "VAULT_LOCKED", fmt.Sprintf("max failed attempts (%d) reached; vault locked for 15m", MaxFailedAttempts), ErrVaultLocked)
+		}
+		return ErrInvalidPassphrase
+	}
+
+	next := applyFailureTransition(state, now, v.opts.StrictLockoutWipe)
+	if next.WipedLocked {
+		v.Zeroize()
+	}
+	if err := v.opts.LockoutStore.Save(next); err != nil {
 		return err
+	}
+	if next.FailedAttempts >= MaxFailedAttempts {
+		return contract.NewError(contract.ExitPolicyStop, "VAULT_LOCKED", fmt.Sprintf("max failed attempts (%d) reached; vault locked for 15m", MaxFailedAttempts), ErrVaultLocked)
 	}
 	return ErrInvalidPassphrase
 }

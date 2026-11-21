@@ -3,10 +3,12 @@ package mtls
 import (
 	"crypto/ecdsa"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mafifrizi/shuna/internal/flock"
 	"github.com/Mafifrizi/shuna/pkg/contract"
 )
 
@@ -86,6 +89,48 @@ type CRLManager struct {
 	crlNumber   *big.Int
 	lastModTime time.Time
 	lastSize    int64
+	lastDigest  [32]byte
+	hasDigest   bool
+}
+
+func readCRLFile(path string) ([]byte, os.FileInfo, [32]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, [32]byte{}, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, nil, [32]byte{}, err
+	}
+	raw, err := io.ReadAll(f)
+	if err != nil {
+		return nil, nil, [32]byte{}, err
+	}
+	return raw, info, sha256.Sum256(raw), nil
+}
+
+func parseSignedCRL(raw []byte, caCert *x509.Certificate) (map[string]x509.RevocationListEntry, *big.Int, error) {
+	block, _ := pem.Decode(raw)
+	if block == nil || block.Type != "X509 CRL" {
+		return nil, nil, ErrInvalidCRL
+	}
+	rl, err := x509.ParseRevocationList(block.Bytes)
+	if err != nil {
+		return nil, nil, contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", "parse CRL failed", err)
+	}
+	if err := rl.CheckSignatureFrom(caCert); err != nil {
+		return nil, nil, contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", "CRL signature verification failed", err)
+	}
+	entries := make(map[string]x509.RevocationListEntry, len(rl.RevokedCertificateEntries))
+	for _, e := range rl.RevokedCertificateEntries {
+		entries[FormatSerial(e.SerialNumber)] = e
+	}
+	var nextNum *big.Int
+	if rl.Number != nil {
+		nextNum = new(big.Int).Add(rl.Number, big.NewInt(1))
+	}
+	return entries, nextNum, nil
 }
 
 // LoadCRL loads and verifies an existing signed PEM CRL against caCert for read-only lookups.
@@ -106,58 +151,81 @@ func OpenCRLManager(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, crlPath s
 		crlNumber: big.NewInt(1),
 	}
 
-	raw, err := os.ReadFile(crlPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			if caKey == nil {
+	applyLoaded := func(raw []byte, info os.FileInfo, digest [32]byte) error {
+		entries, nextNum, err := parseSignedCRL(raw, caCert)
+		if err != nil {
+			return err
+		}
+		mgr.entries = entries
+		if nextNum != nil {
+			mgr.crlNumber = nextNum
+		}
+		mgr.lastDigest = digest
+		mgr.hasDigest = true
+		if info != nil {
+			mgr.lastModTime = info.ModTime()
+			mgr.lastSize = info.Size()
+		}
+		return nil
+	}
+
+	if caKey == nil {
+		var raw []byte
+		var info os.FileInfo
+		var digest [32]byte
+		err := flock.WithShared(crlPath, 0644, true, func() error {
+			var rErr error
+			raw, info, digest, rErr = readCRLFile(crlPath)
+			return rErr
+		})
+		if err != nil {
+			if os.IsNotExist(err) {
 				return nil, contract.NewError(contract.ExitMissing, "MISSING", "CRL file not found", err)
 			}
-			if err := mgr.writeLocked(); err != nil {
-				return nil, err
-			}
-			return mgr, nil
+			return nil, fmt.Errorf("read CRL: %w", err)
 		}
-		return nil, fmt.Errorf("read CRL: %w", err)
+		if err := applyLoaded(raw, info, digest); err != nil {
+			return nil, err
+		}
+		return mgr, nil
 	}
 
-	block, _ := pem.Decode(raw)
-	if block == nil || block.Type != "X509 CRL" {
-		return nil, ErrInvalidCRL
-	}
-	rl, err := x509.ParseRevocationList(block.Bytes)
+	err := flock.WithExclusive(crlPath, 0644, func() error {
+		raw, info, digest, rErr := readCRLFile(crlPath)
+		if rErr != nil {
+			if os.IsNotExist(rErr) {
+				return mgr.writeLocked()
+			}
+			return fmt.Errorf("read CRL: %w", rErr)
+		}
+		return applyLoaded(raw, info, digest)
+	})
 	if err != nil {
-		return nil, contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", "parse CRL failed", err)
-	}
-	if err := rl.CheckSignatureFrom(caCert); err != nil {
-		return nil, contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", "CRL signature verification failed", err)
-	}
-
-	for _, e := range rl.RevokedCertificateEntries {
-		mgr.entries[FormatSerial(e.SerialNumber)] = e
-	}
-	if rl.Number != nil {
-		mgr.crlNumber = new(big.Int).Add(rl.Number, big.NewInt(1))
-	}
-	if info, statErr := os.Stat(crlPath); statErr == nil {
-		mgr.lastModTime = info.ModTime()
-		mgr.lastSize = info.Size()
+		return nil, err
 	}
 	return mgr, nil
 }
 
-// ReloadIfChanged reloads and verifies ca.crl from disk if its modification time or size changed.
+// ReloadIfChanged reloads and verifies ca.crl from disk if its SHA-256 digest changed.
 func (m *CRLManager) ReloadIfChanged() error {
 	if m == nil || m.crlPath == "" {
 		return nil
 	}
-	info, err := os.Stat(m.crlPath)
-	if err != nil {
-		return fmt.Errorf("stat CRL: %w", err)
-	}
 
 	m.mu.RLock()
-	unchanged := info.ModTime().Equal(m.lastModTime) && info.Size() == m.lastSize
+	var raw []byte
+	var info os.FileInfo
+	var digest [32]byte
+	err := flock.WithShared(m.crlPath, 0644, true, func() error {
+		var rErr error
+		raw, info, digest, rErr = readCRLFile(m.crlPath)
+		return rErr
+	})
+	unchanged := err == nil && m.hasDigest && digest == m.lastDigest
 	m.mu.RUnlock()
+	if err != nil {
+		return fmt.Errorf("read CRL: %w", err)
+	}
 	if unchanged {
 		return nil
 	}
@@ -165,40 +233,32 @@ func (m *CRLManager) ReloadIfChanged() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	info, err = os.Stat(m.crlPath)
-	if err != nil {
-		return fmt.Errorf("stat CRL: %w", err)
-	}
-	if info.ModTime().Equal(m.lastModTime) && info.Size() == m.lastSize {
-		return nil
-	}
-
-	raw, err := os.ReadFile(m.crlPath)
+	err = flock.WithShared(m.crlPath, 0644, true, func() error {
+		var rErr error
+		raw, info, digest, rErr = readCRLFile(m.crlPath)
+		return rErr
+	})
 	if err != nil {
 		return fmt.Errorf("read CRL: %w", err)
 	}
-	block, _ := pem.Decode(raw)
-	if block == nil || block.Type != "X509 CRL" {
-		return ErrInvalidCRL
-	}
-	rl, err := x509.ParseRevocationList(block.Bytes)
-	if err != nil {
-		return contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", "parse CRL failed", err)
-	}
-	if err := rl.CheckSignatureFrom(m.caCert); err != nil {
-		return contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", "CRL signature verification failed", err)
+	if m.hasDigest && digest == m.lastDigest {
+		return nil
 	}
 
-	entries := make(map[string]x509.RevocationListEntry, len(rl.RevokedCertificateEntries))
-	for _, e := range rl.RevokedCertificateEntries {
-		entries[FormatSerial(e.SerialNumber)] = e
+	entries, nextNum, err := parseSignedCRL(raw, m.caCert)
+	if err != nil {
+		return err
 	}
 	m.entries = entries
-	if rl.Number != nil {
-		m.crlNumber = new(big.Int).Add(rl.Number, big.NewInt(1))
+	if nextNum != nil {
+		m.crlNumber = nextNum
 	}
-	m.lastModTime = info.ModTime()
-	m.lastSize = info.Size()
+	m.lastDigest = digest
+	m.hasDigest = true
+	if info != nil {
+		m.lastModTime = info.ModTime()
+		m.lastSize = info.Size()
+	}
 	return nil
 }
 
@@ -216,12 +276,48 @@ func (m *CRLManager) Revoke(serialHex string, reason int) (string, error) {
 		return "", errors.New("CA private key required to sign CRL")
 	}
 
-	m.entries[canonical] = x509.RevocationListEntry{
-		SerialNumber:   serial,
-		RevocationTime: time.Now().UTC(),
-		ReasonCode:     reason,
-	}
-	if err := m.writeLocked(); err != nil {
+	err = flock.WithExclusive(m.crlPath, 0644, func() error {
+		if m.crlPath != "" {
+			raw, info, digest, rErr := readCRLFile(m.crlPath)
+			if rErr == nil {
+				if !m.hasDigest || digest != m.lastDigest {
+					entries, nextNum, pErr := parseSignedCRL(raw, m.caCert)
+					if pErr != nil {
+						return pErr
+					}
+					m.entries = entries
+					if nextNum != nil {
+						m.crlNumber = nextNum
+					}
+					m.lastDigest = digest
+					m.hasDigest = true
+					if info != nil {
+						m.lastModTime = info.ModTime()
+						m.lastSize = info.Size()
+					}
+				}
+			} else if !os.IsNotExist(rErr) {
+				return fmt.Errorf("read CRL: %w", rErr)
+			}
+		}
+
+		prev, existed := m.entries[canonical]
+		m.entries[canonical] = x509.RevocationListEntry{
+			SerialNumber:   serial,
+			RevocationTime: time.Now().UTC(),
+			ReasonCode:     reason,
+		}
+		if wErr := m.writeLocked(); wErr != nil {
+			if existed {
+				m.entries[canonical] = prev
+			} else {
+				delete(m.entries, canonical)
+			}
+			return wErr
+		}
+		return nil
+	})
+	if err != nil {
 		return "", err
 	}
 	return canonical, nil
@@ -317,6 +413,8 @@ func (m *CRLManager) writeLocked() error {
 		return fmt.Errorf("rename CRL: %w", err)
 	}
 
+	m.lastDigest = sha256.Sum256(pemBytes)
+	m.hasDigest = true
 	if info, statErr := os.Stat(m.crlPath); statErr == nil {
 		m.lastModTime = info.ModTime()
 		m.lastSize = info.Size()

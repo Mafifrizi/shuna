@@ -3,12 +3,17 @@ package tests
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"os/exec"
@@ -16,6 +21,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -996,5 +1002,532 @@ func TestCLIExitCodesAndWorkflows(t *testing.T) {
 	unsealedOut, err := unsealStdin.Output()
 	if err != nil || string(unsealedOut) != "stdin-secret-payload" {
 		t.Fatalf("unseal stdin mismatch: %q err=%v", unsealedOut, err)
+	}
+}
+
+func snapshotDirHashes(t *testing.T, dir string, names []string) map[string][32]byte {
+	t.Helper()
+	out := make(map[string][32]byte, len(names))
+	for _, n := range names {
+		raw, err := os.ReadFile(filepath.Join(dir, n))
+		if err != nil {
+			t.Fatalf("read %s: %v", n, err)
+		}
+		out[n] = sha256.Sum256(raw)
+	}
+	return out
+}
+
+func TestIssueCertRejectsReservedNamesAndUnsafePaths(t *testing.T) {
+	pkiDir := filepath.Join(t.TempDir(), "pki")
+	if _, err := mtls.InitPKI(pkiDir, []string{"127.0.0.1", "localhost"}, []string{"postgres", "127.0.0.1"}, 24*time.Hour); err != nil {
+		t.Fatalf("InitPKI: %v", err)
+	}
+
+	reservedFiles := []string{"ca.crt", "ca.key", "ca.crl", "server.crt", "server.key", "pg-server.crt", "pg-server.key"}
+	before := snapshotDirHashes(t, pkiDir, reservedFiles)
+
+	policyDenied := []struct {
+		cn   string
+		role mtls.Role
+	}{
+		{"ca", mtls.RoleClient},
+		{"CA", mtls.RoleServer},
+		{" ca ", mtls.RoleClient},
+		{"ca.crt", mtls.RoleClient},
+		{"ca.key", mtls.RoleClient},
+		{"ca.crl", mtls.RoleClient},
+		{"CA.CRL", mtls.RoleServer},
+		{"ca.pem", mtls.RoleClient},
+		{"ca.crl.crt", mtls.RoleClient},
+		{"pg-server", mtls.RoleClient},
+		{"PG-SERVER", mtls.RolePostgres},
+		{"pg-server.crt", mtls.RolePostgres},
+		{"pg-server.key", mtls.RoleClient},
+		{"server", mtls.RoleClient},
+		{"server", mtls.RolePostgres},
+		{"SERVER", mtls.RoleServer},
+		{"Server", mtls.RoleServer},
+		{" server ", mtls.RoleServer},
+		{"server.crt", mtls.RoleServer},
+		{"server.key", mtls.RoleClient},
+		{"server", mtls.RoleServer},
+	}
+	for _, tc := range policyDenied {
+		_, err := mtls.IssueCert(pkiDir, tc.cn, tc.role, []string{"127.0.0.1"}, time.Hour)
+		if contract.CodeOf(err) != contract.ExitPolicyStop {
+			t.Fatalf("IssueCert(%q, %q) code = %d, want %d (err=%v)", tc.cn, tc.role, contract.CodeOf(err), contract.ExitPolicyStop, err)
+		}
+	}
+
+	usageDenied := []string{
+		"", "   ", ".", "..", ".hidden", "foo.", "a/b", "a\\b", "C:foo",
+		"bad\x00cn", "bad\ncn", "foo*bar", "foo?bar", "foo\"bar", "foo<bar", "foo>bar", "foo|bar",
+		"alice.crt", "alice.key", "alice.crl", "alice.pem",
+	}
+	for _, cn := range usageDenied {
+		_, err := mtls.IssueCert(pkiDir, cn, mtls.RoleClient, nil, time.Hour)
+		if contract.CodeOf(err) != contract.ExitUsage {
+			t.Fatalf("IssueCert(%q) code = %d, want %d (err=%v)", cn, contract.CodeOf(err), contract.ExitUsage, err)
+		}
+	}
+
+	after := snapshotDirHashes(t, pkiDir, reservedFiles)
+	for _, name := range reservedFiles {
+		if before[name] != after[name] {
+			t.Fatalf("reserved PKI file %s was modified", name)
+		}
+	}
+
+	issued, err := mtls.IssueCert(pkiDir, " operator-1 ", mtls.RoleClient, nil, time.Hour)
+	if err != nil {
+		t.Fatalf("IssueCert valid trimmed CN: %v", err)
+	}
+	if issued.CommonName != "operator-1" {
+		t.Fatalf("CommonName = %q, want operator-1", issued.CommonName)
+	}
+	cert, err := mtls.LoadCertificate(issued.CertPath)
+	if err != nil {
+		t.Fatalf("LoadCertificate: %v", err)
+	}
+	if cert.Subject.CommonName != "operator-1" {
+		t.Fatalf("Subject.CommonName = %q, want operator-1", cert.Subject.CommonName)
+	}
+}
+
+func TestIssueCertAllowsServerRenewalWhenNeeded(t *testing.T) {
+	pkiDir := filepath.Join(t.TempDir(), "pki")
+	res, err := mtls.InitPKI(pkiDir, []string{"127.0.0.1", "localhost"}, []string{"postgres", "127.0.0.1"}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("InitPKI: %v", err)
+	}
+
+	// Simulate ciel/teamserver/main.go:2510-2514 renewal once >= 50% TTL has elapsed.
+	origCert, err := mtls.LoadCertificate(res.ServerCert.CertPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !mtls.NeedsRenewal(origCert, time.Now().UTC()) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for NeedsRenewal")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	renewed, err := mtls.IssueCert(pkiDir, "server", mtls.RoleServer, []string{"127.0.0.1", "localhost"}, mtls.DefaultServerTTL)
+	if err != nil {
+		t.Fatalf("IssueCert server renewal failed: %v", err)
+	}
+	if renewed.SerialHex == res.ServerCert.SerialHex {
+		t.Fatal("expected renewed server certificate to have a new serial")
+	}
+
+	// Simulate missing server.crt while ca.key exists (ciel/teamserver/main.go:2510).
+	if err := os.Remove(res.ServerCert.CertPath); err != nil {
+		t.Fatal(err)
+	}
+	recreated, err := mtls.IssueCert(pkiDir, "server", mtls.RoleServer, []string{"127.0.0.1", "localhost"}, mtls.DefaultServerTTL)
+	if err != nil {
+		t.Fatalf("IssueCert missing server.crt failed: %v", err)
+	}
+	if recreated.Role != mtls.RoleServer {
+		t.Fatalf("role = %q, want server", recreated.Role)
+	}
+
+	// Verify client issuance and renewal remains intact (ciel/teamserver/main.go:2529,2533).
+	if _, err := mtls.IssueCert(pkiDir, "client", mtls.RoleClient, nil, mtls.DefaultClientTTL); err != nil {
+		t.Fatalf("IssueCert client 1: %v", err)
+	}
+	if _, err := mtls.IssueCert(pkiDir, "client", mtls.RoleClient, nil, mtls.DefaultClientTTL); err != nil {
+		t.Fatalf("IssueCert client 2 (renewal): %v", err)
+	}
+}
+
+func TestLockoutHelperProcess(t *testing.T) {
+	dir := os.Getenv("SHUNA_LOCKOUT_HELPER_DIR")
+	if dir == "" {
+		return
+	}
+	v, err := vault.OpenVault(dir, vault.Options{
+		StrictLockoutWipe: true,
+		Sleep:             func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatalf("helper OpenVault: %v", err)
+	}
+	defer v.Zeroize()
+	_ = v.Unlock([]byte("wrong-pass"))
+}
+
+func TestFileLockoutStoreConcurrentRMW(t *testing.T) {
+	// 1. Direct concurrent FileLockoutStore.Update + Load.
+	storePath := filepath.Join(t.TempDir(), "lockout.json")
+	store := vault.NewFileLockoutStore(storePath)
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 64)
+	for i := 0; i < 16; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := store.Update(func(st vault.LockoutState) (vault.LockoutState, error) {
+				st.FailedAttempts++
+				return st, nil
+			}); err != nil {
+				errCh <- err
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := store.Load(); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent FileLockoutStore error: %v", err)
+	}
+	st, err := store.Load()
+	if err != nil || st.FailedAttempts != 16 {
+		t.Fatalf("FailedAttempts = %d, want 16 (err=%v)", st.FailedAttempts, err)
+	}
+
+	// 2. Concurrent distinct *Vault instances failing Unlock concurrently.
+	vaultDir := filepath.Join(t.TempDir(), "vault-concurrent")
+	vInit, _, err := vault.InitVault(vaultDir, []byte("valid-pass"), vault.Options{
+		StrictLockoutWipe: true,
+		Sleep:             func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatalf("InitVault: %v", err)
+	}
+	vInit.Zeroize()
+
+	const workers = 8
+	var unlockWG sync.WaitGroup
+	var lockedCount atomic.Int32
+	for i := 0; i < workers; i++ {
+		unlockWG.Add(1)
+		go func() {
+			defer unlockWG.Done()
+			vi, oErr := vault.OpenVault(vaultDir, vault.Options{
+				StrictLockoutWipe: true,
+				Sleep:             func(time.Duration) {},
+			})
+			if oErr != nil {
+				t.Errorf("OpenVault: %v", oErr)
+				return
+			}
+			defer vi.Zeroize()
+			uErr := vi.Unlock([]byte("wrong-pass"))
+			if errors.Is(uErr, vault.ErrVaultLocked) {
+				lockedCount.Add(1)
+			}
+		}()
+	}
+	unlockWG.Wait()
+
+	finalState, err := vInit.LockoutStatus()
+	if err != nil {
+		t.Fatalf("LockoutStatus: %v", err)
+	}
+	if finalState.FailedAttempts != vault.MaxFailedAttempts || !finalState.WipedLocked {
+		t.Fatalf("unexpected lockout state: %+v", finalState)
+	}
+	if lockedCount.Load() != workers-4 {
+		t.Fatalf("lockedCount = %d, want %d", lockedCount.Load(), workers-4)
+	}
+	vCheck, err := vault.OpenVault(vaultDir, vault.Options{StrictLockoutWipe: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := vCheck.Unlock([]byte("valid-pass")); !errors.Is(err, vault.ErrVaultLocked) {
+		t.Fatalf("Unlock with valid pass after strict lockout = %v, want ErrVaultLocked", err)
+	}
+
+	// 3. Multi-process concurrent Vault.Unlock via helper subprocesses.
+	procVaultDir := filepath.Join(t.TempDir(), "vault-multiproc")
+	vp, _, err := vault.InitVault(procVaultDir, []byte("valid-pass"), vault.Options{
+		StrictLockoutWipe: true,
+		Sleep:             func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatalf("InitVault multiproc: %v", err)
+	}
+	vp.Zeroize()
+
+	var procWG sync.WaitGroup
+	procErrs := make(chan error, 5)
+	for i := 0; i < 5; i++ {
+		procWG.Add(1)
+		go func() {
+			defer procWG.Done()
+			cmd := exec.Command(os.Args[0], "-test.run=^TestLockoutHelperProcess$")
+			cmd.Env = append(os.Environ(), "SHUNA_LOCKOUT_HELPER_DIR="+procVaultDir)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				procErrs <- fmt.Errorf("helper failed: %v\n%s", err, out)
+			}
+		}()
+	}
+	procWG.Wait()
+	close(procErrs)
+	for err := range procErrs {
+		t.Fatal(err)
+	}
+	procState, err := vp.LockoutStatus()
+	if err != nil {
+		t.Fatalf("multiproc LockoutStatus: %v", err)
+	}
+	if procState.FailedAttempts != vault.MaxFailedAttempts || !procState.WipedLocked {
+		t.Fatalf("multiproc lockout state = %+v, want FailedAttempts=5 WipedLocked=true", procState)
+	}
+}
+
+func TestCRLManagerConcurrentRevokeAndReload(t *testing.T) {
+	pkiDir := filepath.Join(t.TempDir(), "pki")
+	res, err := mtls.InitPKI(pkiDir, []string{"127.0.0.1"}, []string{"postgres"}, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("InitPKI: %v", err)
+	}
+	caCert, caKey, err := mtls.LoadCA(pkiDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 6
+	serials := make([]string, n)
+	managers := make([]*mtls.CRLManager, n)
+	for i := 0; i < n; i++ {
+		serials[i] = mtls.FormatSerial(big.NewInt(int64(1000 + i)))
+		m, err := mtls.OpenCRLManager(caCert, caKey, res.CRLPath)
+		if err != nil {
+			t.Fatalf("OpenCRLManager %d: %v", i, err)
+		}
+		managers[i] = m
+	}
+
+	var wg sync.WaitGroup
+	stopReaders := make(chan struct{})
+	readerErrs := make(chan error, 32)
+	for r := 0; r < 8; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reader, err := mtls.LoadCRL(res.CRLPath, caCert)
+			if err != nil {
+				readerErrs <- err
+				return
+			}
+			for {
+				select {
+				case <-stopReaders:
+					return
+				default:
+					if err := reader.ReloadIfChanged(); err != nil {
+						readerErrs <- err
+						return
+					}
+					_ = reader.IsRevokedHex(serials[0])
+				}
+			}
+		}()
+	}
+
+	revokeErrs := make(chan error, n)
+	var revokeWG sync.WaitGroup
+	for i := 0; i < n; i++ {
+		revokeWG.Add(1)
+		go func(idx int) {
+			defer revokeWG.Done()
+			if _, err := managers[idx].Revoke(serials[idx], 1); err != nil {
+				revokeErrs <- err
+			}
+		}(i)
+	}
+	revokeWG.Wait()
+	close(stopReaders)
+	wg.Wait()
+	close(readerErrs)
+	close(revokeErrs)
+
+	for err := range revokeErrs {
+		t.Fatalf("concurrent Revoke failed: %v", err)
+	}
+	for err := range readerErrs {
+		t.Fatalf("concurrent ReloadIfChanged failed: %v", err)
+	}
+
+	diskCRL, err := mtls.LoadCRL(res.CRLPath, caCert)
+	if err != nil {
+		t.Fatalf("LoadCRL: %v", err)
+	}
+	for _, s := range serials {
+		if !diskCRL.IsRevokedHex(s) {
+			t.Fatalf("serial %s lost after concurrent Revoke", s)
+		}
+	}
+	for i, m := range managers {
+		if err := m.ReloadIfChanged(); err != nil {
+			t.Fatalf("manager[%d].ReloadIfChanged: %v", i, err)
+		}
+		for _, s := range serials {
+			if !m.IsRevokedHex(s) {
+				t.Fatalf("manager[%d] missing serial %s after ReloadIfChanged", i, s)
+			}
+		}
+	}
+
+	// Multi-process CLI shuna revoke test.
+	binPath := filepath.Join(t.TempDir(), "shuna")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+	buildCmd := exec.Command("go", "build", "-o", binPath, "../cmd/shuna")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, out)
+	}
+
+	cliSerials := []string{
+		mtls.FormatSerial(big.NewInt(2001)),
+		mtls.FormatSerial(big.NewInt(2002)),
+		mtls.FormatSerial(big.NewInt(2003)),
+		mtls.FormatSerial(big.NewInt(2004)),
+	}
+	var cliWG sync.WaitGroup
+	cliErrs := make(chan error, len(cliSerials))
+	for _, s := range cliSerials {
+		cliWG.Add(1)
+		go func(ser string) {
+			defer cliWG.Done()
+			cmd := exec.Command(binPath, "revoke", "--pki-dir", pkiDir, "--serial", ser, "--reason", "key_compromise", "--json")
+			if out, err := cmd.CombinedOutput(); err != nil {
+				cliErrs <- fmt.Errorf("cli revoke %s: %v\n%s", ser, err, out)
+			}
+		}(s)
+	}
+	cliWG.Wait()
+	close(cliErrs)
+	for err := range cliErrs {
+		t.Fatal(err)
+	}
+
+	afterCLI, err := mtls.LoadCRL(res.CRLPath, caCert)
+	if err != nil {
+		t.Fatalf("LoadCRL after CLI revokes: %v", err)
+	}
+	for _, s := range append(serials, cliSerials...) {
+		if !afterCLI.IsRevokedHex(s) {
+			t.Fatalf("serial %s missing after multi-process CLI revokes", s)
+		}
+	}
+}
+
+func TestCRLReloadIfChangedSubSecondSameSizeAndMtime(t *testing.T) {
+	pkiDir := filepath.Join(t.TempDir(), "pki")
+	res, err := mtls.InitPKI(pkiDir, []string{"127.0.0.1"}, []string{"postgres"}, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("InitPKI: %v", err)
+	}
+	caCert, caKey, err := mtls.LoadCA(pkiDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signCRL := func(num int64, ser *big.Int) []byte {
+		now := time.Now().UTC()
+		tmpl := &x509.RevocationList{
+			Number:     big.NewInt(num),
+			ThisUpdate: now.Add(-1 * time.Minute),
+			NextUpdate: now.Add(mtls.DefaultCRLValidity),
+			RevokedCertificateEntries: []x509.RevocationListEntry{
+				{
+					SerialNumber:   ser,
+					RevocationTime: now,
+					ReasonCode:     1,
+				},
+			},
+		}
+		der, err := x509.CreateRevocationList(rand.Reader, tmpl, caCert, caKey)
+		if err != nil {
+			t.Fatalf("CreateRevocationList: %v", err)
+		}
+		return pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der})
+	}
+
+	serA := big.NewInt(0x1111)
+	serB := big.NewInt(0x2222)
+	hexA := mtls.FormatSerial(serA)
+	hexB := mtls.FormatSerial(serB)
+
+	pem1 := signCRL(10, serA)
+	if err := os.WriteFile(res.CRLPath, pem1, 0644); err != nil {
+		t.Fatal(err)
+	}
+	info1, err := os.Stat(res.CRLPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := mtls.LoadCRL(res.CRLPath, caCert)
+	if err != nil {
+		t.Fatalf("LoadCRL: %v", err)
+	}
+	if !reader.IsRevokedHex(hexA) || reader.IsRevokedHex(hexB) {
+		t.Fatal("unexpected initial revocation state")
+	}
+
+	var pem2 []byte
+	for i := 0; i < 64; i++ {
+		cand := signCRL(11, serB)
+		if len(cand) == len(pem1) {
+			pem2 = cand
+			break
+		}
+	}
+	if pem2 == nil {
+		t.Fatal("failed to generate same-length ECDSA CRL PEM within 64 attempts")
+	}
+	if err := os.WriteFile(res.CRLPath, pem2, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(res.CRLPath, info1.ModTime(), info1.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	info2, err := os.Stat(res.CRLPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info2.ModTime().Equal(info1.ModTime()) || info2.Size() != info1.Size() {
+		t.Fatalf("expected identical mtime and size, got (%v,%d) vs (%v,%d)", info2.ModTime(), info2.Size(), info1.ModTime(), info1.Size())
+	}
+
+	if err := reader.ReloadIfChanged(); err != nil {
+		t.Fatalf("ReloadIfChanged: %v", err)
+	}
+	if !reader.IsRevokedHex(hexB) || reader.IsRevokedHex(hexA) {
+		t.Fatalf("ReloadIfChanged missed identical-mtime/identical-size CRL replacement (hexA=%v hexB=%v)", reader.IsRevokedHex(hexA), reader.IsRevokedHex(hexB))
+	}
+
+	// Verify rapid back-to-back Revoke calls without sleep are immediately visible via ReloadIfChanged.
+	writer, err := mtls.OpenCRLManager(caCert, caKey, res.CRLPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rapid1 := hex.EncodeToString([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x33, 0x33})
+	rapid2 := hex.EncodeToString([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x44, 0x44})
+	if _, err := writer.Revoke(rapid1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Revoke(rapid2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.ReloadIfChanged(); err != nil {
+		t.Fatal(err)
+	}
+	if !reader.IsRevokedHex(rapid1) || !reader.IsRevokedHex(rapid2) {
+		t.Fatal("rapid consecutive Revoke calls not visible after ReloadIfChanged")
 	}
 }

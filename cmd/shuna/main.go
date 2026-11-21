@@ -19,6 +19,8 @@ import (
 	"github.com/Mafifrizi/shuna/pkg/vault"
 )
 
+var version = "1.0.0"
+
 type cmdResult struct {
 	Message string
 	Data    any
@@ -64,6 +66,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		res, err = cmdVerify(args[1:])
 	case "unlock-reset":
 		res, err = cmdUnlockReset(args[1:])
+	case "-V", "--version", "version":
+		res, err = cmdVersion(args[1:])
 	default:
 		err = contract.NewError(contract.ExitUsage, "USAGE", fmt.Sprintf("unknown subcommand %q", sub), nil)
 	}
@@ -122,6 +126,18 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 		return contract.NewError(contract.ExitUsage, "USAGE", fmt.Sprintf("unexpected positional arguments: %v", fs.Args()), nil)
 	}
 	return nil
+}
+
+func cmdVersion(args []string) (cmdResult, error) {
+	fs := newFlagSet("version")
+	_ = fs.Bool("json", false, "emit JSON output")
+	if err := parseFlags(fs, args); err != nil {
+		return cmdResult{}, err
+	}
+	return cmdResult{
+		Message: fmt.Sprintf("shuna %s", version),
+		Data:    map[string]any{"version": version},
+	}, nil
 }
 
 func resolvePassphrase(envName string, required bool) ([]byte, error) {
@@ -786,6 +802,7 @@ Usage:
   shuna rotate       --vault <dir> [--passphrase-env VAR] [--new-passphrase-env VAR] [--retire-old] [--strict-mlock] [--json]
   shuna verify       --pki-dir <dir> [--cert <path>] [--json]
   shuna unlock-reset --vault <dir> --recovery-key <path> [--new-passphrase-env VAR] [--strict-mlock] [--json]
+  shuna version      [--json]  (aliases: --version, -V)
 
 Exit codes:
   0  OK

@@ -169,11 +169,11 @@ func InitPKI(outDir string, hosts, pgHosts []string, leafTTL time.Duration) (*PK
 		pgHosts = []string{"postgres", "127.0.0.1"}
 	}
 
-	serverCert, err := IssueCert(outDir, "server", RoleServer, hosts, serverTTL)
+	serverCert, err := issueCert(outDir, "server", RoleServer, hosts, serverTTL)
 	if err != nil {
 		return nil, err
 	}
-	pgCert, err := IssueCert(outDir, "pg-server", RolePostgres, pgHosts, serverTTL)
+	pgCert, err := issueCert(outDir, "pg-server", RolePostgres, pgHosts, serverTTL)
 	if err != nil {
 		return nil, err
 	}
@@ -197,6 +197,24 @@ func IssueCert(pkiDir, cn string, role Role, hosts []string, ttl time.Duration) 
 	if err != nil {
 		return nil, err
 	}
+	if strings.EqualFold(safeName, "server") {
+		if role != RoleServer || cn != "server" {
+			return nil, contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", fmt.Sprintf("reserved PKI certificate name %q cannot be issued", cn), nil)
+		}
+		srvPath := filepath.Join(pkiDir, "server.crt")
+		if existing, loadErr := LoadCertificate(srvPath); loadErr == nil && !NeedsRenewal(existing, time.Now().UTC()) {
+			return nil, contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", "reserved PKI certificate \"server\" already exists and does not need renewal", nil)
+		}
+	}
+	return issueCert(pkiDir, safeName, role, hosts, ttl)
+}
+
+func issueCert(pkiDir, cn string, role Role, hosts []string, ttl time.Duration) (*IssuedCert, error) {
+	cn = strings.TrimSpace(cn)
+	if pkiDir == "" || cn == "" {
+		return nil, contract.NewError(contract.ExitUsage, "USAGE", "pki-dir and cn are required", nil)
+	}
+	safeName := cn
 
 	caCert, caKey, err := LoadCA(pkiDir)
 	if err != nil {
@@ -580,9 +598,37 @@ func writeECKeyPEM(path string, key *ecdsa.PrivateKey) error {
 }
 
 func sanitizeFileBase(name string) (string, error) {
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return "", contract.NewError(contract.ExitUsage, "USAGE", fmt.Sprintf("unsafe certificate common name %q", name), nil)
+		}
+	}
 	base := strings.TrimSpace(name)
-	if base == "" || strings.Contains(base, "/") || strings.Contains(base, "\\") || strings.Contains(base, "..") {
+	if base == "" ||
+		strings.ContainsAny(base, "/\\:\x00*?\"<>|") ||
+		strings.Contains(base, "..") ||
+		strings.HasPrefix(base, ".") ||
+		strings.HasSuffix(base, ".") {
 		return "", contract.NewError(contract.ExitUsage, "USAGE", fmt.Sprintf("unsafe certificate common name %q", name), nil)
+	}
+
+	lower := strings.ToLower(base)
+	stem := lower
+	for _, ext := range []string{".crt", ".key", ".crl", ".pem"} {
+		if strings.HasSuffix(lower, ext) {
+			stem = strings.TrimSuffix(lower, ext)
+			break
+		}
+	}
+	switch stem {
+	case "ca", "ca.crl", "pg-server", "server":
+		if lower == "server" {
+			return base, nil
+		}
+		return "", contract.NewError(contract.ExitPolicyStop, "POLICY_STOP", fmt.Sprintf("reserved PKI certificate name %q cannot be issued", name), nil)
+	}
+	if stem != lower {
+		return "", contract.NewError(contract.ExitUsage, "USAGE", fmt.Sprintf("certificate common name %q must not include key/cert extension", name), nil)
 	}
 	return base, nil
 }

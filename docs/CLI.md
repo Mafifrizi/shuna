@@ -82,6 +82,18 @@ Issue a client (24h default TTL), server (7d default), or postgres (7d default) 
 shuna issue-cert --pki-dir ./pki --cn operator-01 --role client [--hosts ...] [--ttl 24h] [--json]
 ```
 
+Reserved PKI names (ca, server, pg-server, ca.crl, and .crt/.key/.crl/.pem variants, case-insensitive) cannot be overwritten via issue-cert (exit code 2, POLICY_STOP), except server renewal when role is server and server.crt is missing or within its renewal window.
+
+### version
+
+Print the CLI version (aliases: --version, -V):
+
+```sh
+shuna --version
+shuna -V
+shuna version --json
+```
+
 ### revoke & verify
 
 ```sh
