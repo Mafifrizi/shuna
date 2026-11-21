@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Mafifrizi/shuna/internal/fsutil"
 	"github.com/Mafifrizi/shuna/pkg/contract"
 	"github.com/Mafifrizi/shuna/pkg/envelope"
 	"github.com/Mafifrizi/shuna/pkg/kdf"
@@ -229,7 +230,7 @@ func SaveRecoveryKeyPair(dir string, priv *HybridPrivateKey, pub *HybridPublicKe
 	if err != nil {
 		return "", "", err
 	}
-	if err := os.WriteFile(pubPath, pubBytes, 0644); err != nil {
+	if err := fsutil.WriteAtomic(pubPath, pubBytes, 0644); err != nil {
 		return "", "", fmt.Errorf("write recovery.pub: %w", err)
 	}
 
@@ -238,7 +239,7 @@ func SaveRecoveryKeyPair(dir string, priv *HybridPrivateKey, pub *HybridPublicKe
 		return "", "", err
 	}
 	defer kdf.WipeBytes(privBytes)
-	if err := os.WriteFile(privPath, privBytes, 0600); err != nil {
+	if err := fsutil.WriteAtomic(privPath, privBytes, 0600); err != nil {
 		return "", "", fmt.Errorf("write recovery.key: %w", err)
 	}
 	return pubPath, privPath, nil

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Mafifrizi/shuna/internal/flock"
+	"github.com/Mafifrizi/shuna/internal/fsutil"
 	"github.com/Mafifrizi/shuna/pkg/contract"
 	"github.com/Mafifrizi/shuna/pkg/envelope"
 	"github.com/Mafifrizi/shuna/pkg/kdf"
@@ -58,6 +59,7 @@ type LockoutState struct {
 	CooldownUntil  time.Time `json:"cooldown_until,omitempty"`
 	LastFailureAt  time.Time `json:"last_failure_at,omitempty"`
 	WipedLocked    bool      `json:"wiped_locked,omitempty"`
+	ResetAt        time.Time `json:"reset_at,omitempty"`
 }
 
 // LockoutStore persists LockoutState durably.
@@ -99,7 +101,7 @@ func (s *FileLockoutStore) saveUnlocked(st LockoutState) error {
 	if err != nil {
 		return err
 	}
-	return writeAtomic(s.path, data, 0600)
+	return fsutil.WriteAtomic(s.path, data, 0600)
 }
 
 func (s *FileLockoutStore) Load() (LockoutState, error) {
@@ -358,6 +360,13 @@ func (v *Vault) MlockWarning() string {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	return v.mlockWarning
+}
+
+// StrictLockoutWipe reports whether strict lockout wipe is enabled via options or vault metadata.
+func (v *Vault) StrictLockoutWipe() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.opts.StrictLockoutWipe || v.meta.StrictLockoutWipe
 }
 
 // LockoutStatus returns the currently persisted lockout state.
@@ -621,7 +630,7 @@ func (v *Vault) UnlockWithRecoveryKey(priv *pqc.HybridPrivateKey, newPassphrase 
 		}
 	}
 
-	if err := v.opts.LockoutStore.Save(LockoutState{}); err != nil {
+	if err := v.opts.LockoutStore.Save(LockoutState{ResetAt: v.opts.Now().UTC()}); err != nil {
 		for _, d := range loaded {
 			kdf.WipeBytes(d)
 			_ = kdf.UnlockSensitiveMemory(d)
@@ -923,7 +932,7 @@ func (v *Vault) saveMetaLocked() error {
 	if err != nil {
 		return err
 	}
-	return writeAtomic(v.metaPath, data, 0600)
+	return fsutil.WriteAtomic(v.metaPath, data, 0600)
 }
 
 func wrapDEKWithPassphrase(version uint32, dek, passphrase []byte) ([]byte, []byte, error) {
@@ -976,32 +985,4 @@ func wrapAAD(version uint32) []byte {
 
 func recoveryAAD(version uint32) []byte {
 	return []byte(fmt.Sprintf("%s|%d", pqc.RecoveryAADPrefix, version))
-}
-
-func writeAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".shuna.tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	return nil
 }

@@ -11,13 +11,13 @@ import (
 	"io"
 	"math/big"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Mafifrizi/shuna/internal/flock"
+	"github.com/Mafifrizi/shuna/internal/fsutil"
 	"github.com/Mafifrizi/shuna/pkg/contract"
 )
 
@@ -388,29 +388,8 @@ func (m *CRLManager) writeLocked() error {
 	}
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der})
 
-	dir := filepath.Dir(m.crlPath)
-	tmp, err := os.CreateTemp(dir, ".ca.crl.tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temp CRL: %w", err)
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(pemBytes); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("write temp CRL: %w", err)
-	}
-	if err := tmp.Chmod(0644); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("chmod temp CRL: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("close temp CRL: %w", err)
-	}
-	if err := os.Rename(tmpName, m.crlPath); err != nil {
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("rename CRL: %w", err)
+	if err := fsutil.WriteAtomic(m.crlPath, pemBytes, 0644); err != nil {
+		return fmt.Errorf("write CRL: %w", err)
 	}
 
 	m.lastDigest = sha256.Sum256(pemBytes)

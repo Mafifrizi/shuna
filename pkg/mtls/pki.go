@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mafifrizi/shuna/internal/fsutil"
 	"github.com/Mafifrizi/shuna/pkg/contract"
 )
 
@@ -585,7 +586,7 @@ func newRandomSerial() (*big.Int, error) {
 
 func writeCertPEM(path string, der []byte) error {
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	return os.WriteFile(path, pemBytes, 0644)
+	return fsutil.WriteAtomic(path, pemBytes, 0644)
 }
 
 func writeECKeyPEM(path string, key *ecdsa.PrivateKey) error {
@@ -593,8 +594,10 @@ func writeECKeyPEM(path string, key *ecdsa.PrivateKey) error {
 	if err != nil {
 		return fmt.Errorf("marshal EC private key: %w", err)
 	}
+	defer clear(der)
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
-	return os.WriteFile(path, pemBytes, 0600)
+	defer clear(pemBytes)
+	return fsutil.WriteAtomic(path, pemBytes, 0600)
 }
 
 func sanitizeFileBase(name string) (string, error) {
